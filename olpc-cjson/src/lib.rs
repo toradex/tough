@@ -187,15 +187,17 @@ impl Formatter for CanonicalFormatter {
     }
 
     // Only quotes and backslashes are escaped in canonical JSON.
+    // TRX: Our cjson implementation is in fact valid json and therefore allows literal \n (0x5c6c)
+    // on a json string, following the json spec. 
     fn write_char_escape<W: Write + ?Sized>(
         &mut self,
         writer: &mut W,
         char_escape: CharEscape,
     ) -> Result<()> {
         match char_escape {
-            CharEscape::Quote | CharEscape::ReverseSolidus => {
+            CharEscape::Quote | CharEscape::ReverseSolidus | CharEscape::LineFeed => {
                 self.writer(writer).write_all(b"\\")?;
-            }
+            },
             _ => {}
         }
         self.writer(writer).write_all(&[match char_escape {
@@ -204,7 +206,7 @@ impl Formatter for CanonicalFormatter {
             CharEscape::Solidus => b'/',
             CharEscape::Backspace => b'\x08',
             CharEscape::FormFeed => b'\x0c',
-            CharEscape::LineFeed => b'\n',
+            CharEscape::LineFeed => b'n',// TRX
             CharEscape::CarriageReturn => b'\r',
             CharEscape::Tab => b'\t',
             CharEscape::AsciiControl(byte) => byte,

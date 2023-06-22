@@ -64,6 +64,13 @@ pub enum Error {
         backtrace: Backtrace,
     },
 
+    /// Failed to decode a base64-encoded string.
+    #[snafu(display("Invalid base64 string: {}", source))]
+    Base64Decode {
+        source: base64::DecodeError,
+        backtrace: Backtrace,
+    },    
+
     /// The library failed to serialize an object to JSON.
     #[snafu(display("Failed to serialize {} to JSON: {}", what, source))]
     JsonSerialization {

@@ -35,6 +35,8 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::str::FromStr;
 
+use self::decoded::Base64;
+
 /// The type of metadata role.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "kebab-case")]
@@ -53,6 +55,10 @@ pub enum RoleType {
     Timestamp,
     /// A delegated targets role
     DelegatedTargets,
+
+    /// RemoteSessions role
+    // TRX: Only in uptane
+    RemoteSessions,
 }
 
 derive_display_from_serialize!(RoleType);
@@ -113,7 +119,7 @@ pub struct Signature {
     /// The key ID (listed in root.json) that made this signature.
     pub keyid: Decoded<Hex>,
     /// A hex-encoded signature of the canonical JSON form of a role.
-    pub sig: Decoded<Hex>,
+    pub sig: Decoded<Base64>,
 }
 
 /// A `KeyHolder` is metadata that is responsible for verifying the signatures of a role.
@@ -134,10 +140,11 @@ pub enum KeyHolder {
 /// roles in this file.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "_type")]
-#[serde(rename = "root")]
+#[serde(rename = "Root")]
 pub struct Root {
     /// A string that contains the version number of the TUF specification. Its format follows the
     /// Semantic Versioning 2.0.0 (semver) specification.
+    #[serde(skip, default = "String::new")]
     pub spec_version: String,
 
     /// A boolean indicating whether the repository supports consistent snapshots. When consistent
@@ -160,7 +167,8 @@ pub struct Root {
 
     /// A list of roles, the keys associated with each role, and the threshold of signatures used
     /// for each role.
-    pub roles: HashMap<RoleType, RoleKeys>,
+    // TRX: We need to support unknown RoleTypes so we use a custom type for `roles`
+    pub roles: Roles,
 
     /// Extra arguments found during deserialization.
     ///
@@ -170,6 +178,41 @@ pub struct Root {
     #[serde(flatten)]
     #[serde(deserialize_with = "de::extra_skip_type")]
     pub _extra: HashMap<String, Value>,
+}
+
+
+/// Hold roles in Root
+// TRX: This allows storing unknown roles for deserialization
+#[derive(Eq, PartialEq, Clone, Serialize, Deserialize, Debug)]
+pub struct Roles(HashMap<String, RoleKeys>);
+
+impl Roles {
+    /// Delegate to underlying map
+    pub fn get(&self, role: &RoleType) -> Option<&RoleKeys> {
+        let role_str = role.to_string(); // Uses serde via derived Display
+        self.0.get(&role_str)
+    }
+
+    /// Create a Roles from an HashMap
+    /// Relies on to_string/Display and from_string derived for RoleType using serde
+    pub fn new(roles: &HashMap<RoleType, RoleKeys>) -> Self {
+        Self(roles.iter().map(|(k,v)| (k.to_string(), v.clone()) ).collect())
+    }
+}
+
+impl<'a> IntoIterator for &'a Roles {
+    type Item = (RoleType, &'a RoleKeys);
+
+    type IntoIter = Box<dyn Iterator<Item = Self::Item> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let it = self.0.iter().flat_map(|(k, v)| {
+            let role_type = RoleType::from_str(&k);
+            role_type.ok().map(|rt| (rt, v))
+        });
+
+        Box::new(it)
+    }
 }
 
 /// Represents the key IDs used for a role and the threshold of signatures required to validate it.
@@ -243,10 +286,12 @@ impl Role for Root {
 /// lengths and file hashes.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "_type")]
-#[serde(rename = "snapshot")]
+// TRX: We use Snapshot, not snapshot
+#[serde(rename = "Snapshot")]
 pub struct Snapshot {
     /// A string that contains the version number of the TUF specification. Its format follows the
     /// Semantic Versioning 2.0.0 (semver) specification.
+    #[serde(skip, default = "String::new")]
     pub spec_version: String,
 
     /// An integer that is greater than 0. Clients MUST NOT replace a metadata file with a version
@@ -320,6 +365,43 @@ pub struct SnapshotMeta {
     pub _extra: HashMap<String, Value>,
 }
 
+/// A role describing allowed remote sessions for this repository
+#[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
+pub struct RemoteSessions {
+    /// A json blob describing the allowed remote sessions
+    pub remote_sessions: Value,
+
+    /// Determines when metadata should be considered expired and no longer trusted by clients.
+    pub expires: DateTime<Utc>,
+
+    /// An integer that is greater than 0.
+    pub version: NonZeroU64,
+
+    /// Extra arguments found during deserialization
+    ///
+    /// We must store these to correctly verify signatures for this object.
+    ///
+    /// If you're instantiating this struct, you should make this `HashMap::empty()`.
+    #[serde(flatten)]
+    pub _extra: HashMap<String, Value>,
+}
+
+impl Role for RemoteSessions {
+    const TYPE: RoleType = RoleType::RemoteSessions;
+
+    fn expires(&self) -> DateTime<Utc> {
+        self.expires
+    }
+
+    fn version(&self) -> NonZeroU64 {
+        self.version
+    }
+
+    fn filename(&self, _consistent_snapshot: bool) -> String {
+        format!("{}.remote-sessions.json", self.version())
+    }
+}
+
 /// Represents the hash dictionary in a `snapshot.json` file.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
 pub struct Hashes {
@@ -384,10 +466,13 @@ impl Role for Snapshot {
 ///
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "_type")]
-#[serde(rename = "targets")]
+// TRX: We use Targets, not targets
+#[serde(rename = "Targets")]
 pub struct Targets {
     /// A string that contains the version number of the TUF specification. Its format follows the
     /// Semantic Versioning 2.0.0 (semver) specification.
+    // #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip, default = "String::new")]
     pub spec_version: String,
 
     /// An integer that is greater than 0. Clients MUST NOT replace a metadata file with a version
@@ -1091,10 +1176,12 @@ impl DelegatedRole {
 /// unaware of interference with obtaining updates.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "_type")]
-#[serde(rename = "timestamp")]
+// TRX: We use Timestamp, not timestamp
+#[serde(rename = "Timestamp")]
 pub struct Timestamp {
     /// A string that contains the version number of the TUF specification. Its format follows the
     /// Semantic Versioning 2.0.0 (semver) specification.
+    #[serde(skip, default = "String::new")]
     pub spec_version: String,
 
     /// An integer that is greater than 0. Clients MUST NOT replace a metadata file with a version

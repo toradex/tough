@@ -60,6 +60,7 @@ pub use crate::transport::{
 use chrono::{DateTime, Utc};
 use log::warn;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use schema::RemoteSessions;
 use snafu::{ensure, OptionExt, ResultExt};
 use std::collections::HashMap;
 use std::fs::create_dir_all;
@@ -195,6 +196,11 @@ impl<R: Read> RepositoryLoader<R> {
         Repository::load(self)
     }
 
+    /// Load and verify Uptane repository metadata.
+    pub fn load_uptane(self) -> Result<UptaneRepository> {
+        UptaneRepository::load(self)
+    }    
+
     /// Set the transport. If no transport has been set, [`DefaultTransport`] will be used.
     #[must_use]
     pub fn transport<T: Transport + Send + Sync + 'static>(mut self, transport: T) -> Self {
@@ -310,7 +316,71 @@ pub struct Repository {
     expiration_enforcement: ExpirationEnforcement,
 }
 
+/// An Uptane repository
+///
+/// You can create a `Repository` using a [`RepositoryLoader`].
+#[derive(Debug, Clone)]
+pub struct UptaneRepository {
+    root: Signed<Root>,
+    remote_sessions: std::result::Result<Signed<crate::schema::RemoteSessions>, String>,
+}
+
+impl UptaneRepository {
+    fn load<R: Read>(loader: RepositoryLoader<R>) -> Result<UptaneRepository> {
+        let datastore = Datastore::new(loader.datastore)?;
+        let transport = loader
+            .transport
+            .unwrap_or_else(|| Box::new(DefaultTransport::new()));
+        let limits = loader.limits.unwrap_or_default();
+        let expiration_enforcement = loader.expiration_enforcement.unwrap_or_default();
+        let metadata_base_url = parse_url(loader.metadata_base_url)?;
+
+        // 0. Load the trusted root metadata file + 1. Update the root metadata file
+        let root = load_root(
+            transport.as_ref(),
+            loader.root,
+            &datastore,
+            limits.max_root_size,
+            limits.max_root_updates,
+            &metadata_base_url,
+            expiration_enforcement,
+        )?;
+
+        let remote_sessions = match root.signed.roles.get(&RoleType::RemoteSessions) {
+            Some(_) => load_remote_sessions(
+                transport.as_ref(),
+                &root,
+                &datastore,
+                limits.max_timestamp_size,
+                &metadata_base_url,
+                expiration_enforcement
+            ).map_err(|err|
+                format!("{}", err)
+            ),
+            None =>
+                Err("remote-sessions not set in root.json".to_string())
+        };
+
+        Ok(Self {
+            root,
+            remote_sessions,
+        })
+    }
+
+    /// Returns a reference to the signed root
+    pub fn root(&self) -> &Signed<Root> {
+        &self.root
+    }
+
+    /// Returns a reference to the signed remote sessions
+    pub fn remote_sessions(&self) -> std::result::Result<&Signed<RemoteSessions>, String> {
+        self.remote_sessions.as_ref().map_err(|err|err.to_owned())
+    }
+
+}
+
 impl Repository {
+
     /// Load and verify TUF repository metadata using a [`RepositoryLoader`] for the settings.
     fn load<R: Read>(loader: RepositoryLoader<R>) -> Result<Self> {
         let datastore = Datastore::new(loader.datastore)?;
@@ -1209,6 +1279,64 @@ fn load_delegations(
         }
     }
     Ok(())
+}
+
+fn load_remote_sessions(
+    transport: &dyn Transport,
+    root: &Signed<Root>,
+    datastore: &Datastore,
+    max_remote_sessions_size: u64,
+    metadata_base_url: &Url,
+    expiration_enforcement: ExpirationEnforcement,
+) -> Result<Signed<RemoteSessions>> {
+    let path = "remote-sessions.json";
+    let reader = fetch_max_size(
+        transport,
+        metadata_base_url.join(path).context(error::JoinUrlSnafu {
+            path,
+            url: metadata_base_url.clone(),
+        })?,
+        max_remote_sessions_size,
+        "max_timestamp_size argument",
+    )?;
+
+
+    let remote_sessions: Signed<RemoteSessions> =
+        serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+            role: RoleType::RemoteSessions,
+        })?;
+
+    root.signed
+        .verify_role(&remote_sessions)
+        .context(error::VerifyMetadataSnafu {
+            role: RoleType::RemoteSessions,
+        })?;
+
+    // 2.2. Check for a rollback attack.
+    if let Some(Ok(old_remote_sessions)) = datastore
+        .reader("remote-sessions.json")?
+        .map(serde_json::from_reader::<_, Signed<RemoteSessions>>)
+    {
+        if root.signed.verify_role(&old_remote_sessions).is_ok() {
+            ensure!(
+                old_remote_sessions.signed.version <= old_remote_sessions.signed.version,
+                error::OlderMetadataSnafu {
+                    role: RoleType::Timestamp,
+                    current_version: old_remote_sessions.signed.version,
+                    new_version: old_remote_sessions.signed.version
+                }
+            );
+        }
+    }
+
+    // TUF v1.0.16, 5.3.3. Check for a freeze attack
+    if expiration_enforcement == ExpirationEnforcement::Safe {
+        check_expired(datastore, &remote_sessions.signed)?;
+    }
+
+    datastore.create("remote-sessions.json", &remote_sessions)?;
+
+    Ok(remote_sessions)
 }
 
 #[cfg(test)]

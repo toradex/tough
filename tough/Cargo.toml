@@ -9,6 +9,7 @@ keywords = ["tuf", "update", "repository"]
 edition = "2018"
 
 [dependencies]
+base64 = "0.21.2"
 chrono = { version = "0.4", default-features = false, features = ["std", "alloc", "serde", "clock"] }
 dyn-clone = "1"
 globset = { version = "0.4" }
@@ -24,6 +25,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_plain = "1"
 snafu = "0.7"
+spki = { version = "0.7.2", features = ["alloc", "pem"] }
 tempfile = "3"
 untrusted = "0.7"
 url = "2"

@@ -104,7 +104,7 @@ impl RepositoryEditor {
         for (roletype, rolekeys) in &root.signed.roles {
             if rolekeys.threshold.get() > rolekeys.keyids.len() as u64 {
                 return Err(error::Error::UnstableRoot {
-                    role: *roletype,
+                    role: roletype,
                     threshold: rolekeys.threshold.get(),
                     actual: rolekeys.keyids.len(),
                 });
