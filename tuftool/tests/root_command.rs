@@ -43,18 +43,30 @@ fn initialize_root_json(root_json: &str) {
         .success();
 }
 
-fn add_key_root(key: &str, root_json: &str) {
-    Command::cargo_bin("tuftool")
-        .unwrap()
-        .args(["root", "add-key", root_json, key, "--role", "root"])
-        .assert()
-        .success();
+fn add_key_root(keys: &Vec<&str>, root_json: &str) {
+    let mut cmd = Command::cargo_bin("tuftool").unwrap();
+
+    cmd.args(["root", "add-key", root_json, "--role", "root"]);
+
+    for key in keys {
+        cmd.args(["-k", key]);
+    }
+
+    cmd.assert().success();
 }
 
 fn add_key_timestamp(key: &str, root_json: &str) {
     Command::cargo_bin("tuftool")
         .unwrap()
-        .args(["root", "add-key", root_json, key, "--role", "timestamp"])
+        .args([
+            "root",
+            "add-key",
+            root_json,
+            "-k",
+            key,
+            "--role",
+            "timestamp",
+        ])
         .assert()
         .success();
 }
@@ -62,20 +74,25 @@ fn add_key_timestamp(key: &str, root_json: &str) {
 fn add_key_snapshot(key: &str, root_json: &str) {
     Command::cargo_bin("tuftool")
         .unwrap()
-        .args(["root", "add-key", root_json, key, "--role", "snapshot"])
+        .args([
+            "root", "add-key", root_json, "-k", key, "--role", "snapshot",
+        ])
         .assert()
         .success();
 }
 fn add_key_targets(key: &str, root_json: &str) {
     Command::cargo_bin("tuftool")
         .unwrap()
-        .args(["root", "add-key", root_json, key, "--role", "targets"])
+        .args(["root", "add-key", root_json, "-k", key, "--role", "targets"])
         .assert()
         .success();
 }
 
-fn add_key_all_roles(key: &str, root_json: &str) {
-    add_key_root(key, root_json);
+fn add_keys_all_roles(keys: Vec<&str>, root_json: &str) {
+    add_key_root(&keys, root_json);
+
+    // Only add the first key for the rest until we have tests that want it for all keys
+    let key = keys.first().unwrap();
     add_key_timestamp(key, root_json);
     add_key_snapshot(key, root_json);
     add_key_targets(key, root_json);
@@ -136,15 +153,7 @@ fn get_sign_len(root_json: &str) -> usize {
 
 fn check_signature_exists(root_json: &str, key_id: Decoded<Hex>) -> bool {
     let root = get_signed_root(root_json);
-    if root
-        .signatures
-        .iter()
-        .find(|sig| sig.keyid == key_id)
-        .is_none()
-    {
-        return false;
-    }
-    true
+    root.signatures.iter().any(|sig| sig.keyid == key_id)
 }
 
 fn get_version(root_json: &str) -> NonZeroU64 {
@@ -163,9 +172,9 @@ fn create_root() {
     // Create and initialise root.json
     initialize_root_json(root_json.to_str().unwrap());
     // Add keys for all roles
-    add_key_all_roles(key_1.to_str().unwrap(), root_json.to_str().unwrap());
+    add_keys_all_roles(vec![key_1.to_str().unwrap()], root_json.to_str().unwrap());
     // Add second key for root role
-    add_key_root(key_2.to_str().unwrap(), root_json.to_str().unwrap());
+    add_key_root(&vec![key_2.to_str().unwrap()], root_json.to_str().unwrap());
     // Sign root.json with 1 key
     sign_root_json_two_keys(
         key_1.to_str().unwrap(),
@@ -173,6 +182,46 @@ fn create_root() {
         root_json.to_str().unwrap(),
     );
     assert_eq!(get_sign_len(root_json.to_str().unwrap()), 2);
+}
+
+#[test]
+fn create_root_to_version() {
+    let out_dir = TempDir::new().unwrap();
+    let root_json = out_dir.path().join("root.json");
+    let version = NonZeroU64::new(99).unwrap();
+
+    Command::cargo_bin("tuftool")
+        .unwrap()
+        .args([
+            "root",
+            "init",
+            root_json.to_str().unwrap(),
+            "--version",
+            "99",
+        ])
+        .assert()
+        .success();
+
+    // validate version number
+    assert_eq!(get_version(root_json.to_str().unwrap()), version);
+}
+
+#[test]
+fn create_root_invalid_version() {
+    let out_dir = TempDir::new().unwrap();
+    let root_json = out_dir.path().join("root.json");
+
+    Command::cargo_bin("tuftool")
+        .unwrap()
+        .args([
+            "root",
+            "init",
+            root_json.to_str().unwrap(),
+            "--version",
+            "0",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -197,7 +246,7 @@ fn create_unstable_root() {
         .assert()
         .success();
     // Add keys for all roles
-    add_key_all_roles(key.to_str().unwrap(), root_json.to_str().unwrap());
+    add_keys_all_roles(vec![key.to_str().unwrap()], root_json.to_str().unwrap());
     // Sign root.json (error because targets can never be validated root has 1 key but targets requires 2 signatures)
     Command::cargo_bin("tuftool")
         .unwrap()
@@ -222,7 +271,7 @@ fn create_invalid_root() {
     // Create and initialise root.json
     initialize_root_json(root_json.to_str().unwrap());
     // Add keys for all roles
-    add_key_all_roles(key.to_str().unwrap(), root_json.to_str().unwrap());
+    add_keys_all_roles(vec![key.to_str().unwrap()], root_json.to_str().unwrap());
     // Sign root.json (error because key is not valid)
     Command::cargo_bin("tuftool")
         .unwrap()
@@ -235,8 +284,8 @@ fn create_invalid_root() {
         .failure();
 }
 
-#[test]
-fn cross_sign_root() {
+#[tokio::test]
+async fn cross_sign_root() {
     let out_dir = TempDir::new().unwrap();
     let old_root_json = test_utils::test_data()
         .join("cross-sign-root")
@@ -250,6 +299,7 @@ fn cross_sign_root() {
     };
     let old_key_id = old_key_source
         .as_sign()
+        .await
         .ok()
         .unwrap()
         .tuf_key()
@@ -258,8 +308,8 @@ fn cross_sign_root() {
     // Create and initialise root.json
     initialize_root_json(new_root_json.to_str().unwrap());
     // Add keys for all roles
-    add_key_all_roles(
-        new_root_key.to_str().unwrap(),
+    add_keys_all_roles(
+        vec![new_root_key.to_str().unwrap()],
         new_root_json.to_str().unwrap(),
     );
     //Sign 2.root.json with key from 1.root.json
@@ -274,7 +324,7 @@ fn cross_sign_root() {
     ));
 }
 
-//cross-signing new_root.json with invalid key ( key not present in old_root.json )
+// cross-signing new_root.json with invalid key ( key not present in old_root.json )
 #[test]
 fn cross_sign_root_invalid_key() {
     let out_dir = TempDir::new().unwrap();
@@ -287,8 +337,11 @@ fn cross_sign_root_invalid_key() {
     // Create and initialise root.json
     initialize_root_json(new_root_json.to_str().unwrap());
     // Add keys for all roles
-    add_key_all_roles(root_key.to_str().unwrap(), new_root_json.to_str().unwrap());
-    //Sign 2.root.json with key not in 1.root.json
+    add_keys_all_roles(
+        vec![root_key.to_str().unwrap()],
+        new_root_json.to_str().unwrap(),
+    );
+    // Sign 2.root.json with key not in 1.root.json
     Command::cargo_bin("tuftool")
         .unwrap()
         .args([
@@ -314,9 +367,32 @@ fn append_signature_root() {
     // Create and initialise root.json
     initialize_root_json(root_json.to_str().unwrap());
     // Add key_1 for all roles
-    add_key_all_roles(key_1.to_str().unwrap(), root_json.to_str().unwrap());
+    add_keys_all_roles(vec![key_1.to_str().unwrap()], root_json.to_str().unwrap());
     // Add key_2 to root
-    add_key_root(key_2.to_str().unwrap(), root_json.to_str().unwrap());
+    add_key_root(&vec![key_2.to_str().unwrap()], root_json.to_str().unwrap());
+    // Sign root.json with key_1
+    sign_root_json(key_1.to_str().unwrap(), root_json.to_str().unwrap());
+    // Sign root.json with key_2
+    sign_root_json(key_2.to_str().unwrap(), root_json.to_str().unwrap());
+
+    //validate number of signatures
+    assert_eq!(get_sign_len(root_json.to_str().unwrap()), 2);
+}
+
+#[test]
+fn add_multiple_keys_root() {
+    let out_dir = TempDir::new().unwrap();
+    let root_json = out_dir.path().join("root.json");
+    let key_1 = test_utils::test_data().join("snakeoil.pem");
+    let key_2 = test_utils::test_data().join("snakeoil_2.pem");
+
+    // Create and initialise root.json
+    initialize_root_json(root_json.to_str().unwrap());
+    // Add key_1 and key_2 for all roles
+    add_keys_all_roles(
+        vec![key_1.to_str().unwrap(), key_2.to_str().unwrap()],
+        root_json.to_str().unwrap(),
+    );
     // Sign root.json with key_1
     sign_root_json(key_1.to_str().unwrap(), root_json.to_str().unwrap());
     // Sign root.json with key_2
@@ -335,9 +411,9 @@ fn below_threshold_failure() {
     // Create and initialise root.json
     initialize_root_json(root_json.to_str().unwrap());
     // Add key_1 for all roles
-    add_key_all_roles(key_1.to_str().unwrap(), root_json.to_str().unwrap());
+    add_keys_all_roles(vec![key_1.to_str().unwrap()], root_json.to_str().unwrap());
     // Add key_2 to root
-    add_key_root(key_2.to_str().unwrap(), root_json.to_str().unwrap());
+    add_key_root(&vec![key_2.to_str().unwrap()], root_json.to_str().unwrap());
     // Sign root.json with key_1 fails, when no `--ignore-threshold` is passed
     sign_root_json_failure(key_1.to_str().unwrap(), root_json.to_str().unwrap());
 }
@@ -351,13 +427,13 @@ fn set_version_root() {
     initialize_root_json(root_json.to_str().unwrap());
     let version = NonZeroU64::new(5).unwrap();
 
-    //set version to 5
+    // set version to 5
     Command::cargo_bin("tuftool")
         .unwrap()
         .args(["root", "set-version", root_json.to_str().unwrap(), "5"])
         .assert()
         .success();
 
-    //validate version number
+    // validate version number
     assert_eq!(get_version(root_json.to_str().unwrap()), version);
 }

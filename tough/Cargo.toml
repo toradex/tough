@@ -1,6 +1,6 @@
 [package]
 name = "tough"
-version = "0.13.0"
+version = "0.16.0"
 description = "The Update Framework (TUF) repository client"
 authors = ["iliana destroyer of worlds <iweller@amazon.com>"]
 license = "MIT OR Apache-2.0"
@@ -10,34 +10,44 @@ edition = "2018"
 
 [dependencies]
 base64 = "0.21.2"
+async-recursion = "1"
+async-trait = "0.1"
+bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "alloc", "serde", "clock"] }
 dyn-clone = "1"
+futures = "0.3"
+futures-core = "0.3"
 globset = { version = "0.4" }
 hex = "0.4"
 log = "0.4"
 olpc-cjson = { version = "0.1", path = "../olpc-cjson" }
-path-absolutize = "3"
-pem = "1"
+pem = "3"
 percent-encoding = "2"
-reqwest = { version = "0.11", optional = true, default-features = false, features = ["blocking"] }
-ring = { version = "0.16", features = ["std"] }
+reqwest = { version = "0.11", optional = true, default-features = false, features = ["stream"] }
+ring = { version = "0.17", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_plain = "1"
-snafu = "0.7"
 spki = { version = "0.7.2", features = ["alloc", "pem"] }
+snafu = { version = "0.7", features = ["futures"] }
 tempfile = "3"
-untrusted = "0.7"
+tokio = { version = "1", default-features = false, features = ["io-util", "sync", "fs", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+typed-path = "0.7"
+untrusted = "0.9"
 url = "2"
 walkdir = "2"
 
 [dev-dependencies]
+failure-server = { path = "../integ/failure-server" }
 hex-literal = "0.4"
 httptest = "0.15"
 maplit = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tokio-test = "0.4"
 
 [features]
 http = ["reqwest"]
 
-# The `integ` feature enables integration tests. These tests require docker to be running on the host.
+# The `integ` feature enables integration tests. These tests require `noxious-server` to be installed on the host.
 integ = []

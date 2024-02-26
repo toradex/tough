@@ -14,7 +14,7 @@
 //! # Testing
 //!
 //! Unit tests are run in the usual manner: `cargo test`.
-//! Integration tests require docker and are disabled by default behind a feature named `integ`.
+//! Integration tests require `noxious-server` and are disabled by default behind a feature named `integ`.
 //! To run all tests, including integration tests: `cargo test --all-features` or
 //! `cargo test --features 'http,integ'`.
 
@@ -43,30 +43,39 @@ pub mod schema;
 pub mod sign;
 mod target_name;
 mod transport;
+mod urlpath;
 
 use crate::datastore::Datastore;
 use crate::error::Result;
 use crate::fetch::{fetch_max_size, fetch_sha256};
 /// An HTTP transport that includes retries.
 #[cfg(feature = "http")]
-pub use crate::http::{HttpTransport, HttpTransportBuilder, RetryRead};
+pub use crate::http::{HttpTransport, HttpTransportBuilder};
+use crate::io::is_dir;
 use crate::schema::{
     DelegatedRole, Delegations, Role, RoleType, Root, Signed, Snapshot, Timestamp,
 };
 pub use crate::target_name::TargetName;
+pub use crate::transport::IntoVec;
 pub use crate::transport::{
     DefaultTransport, FilesystemTransport, Transport, TransportError, TransportErrorKind,
 };
+pub use crate::urlpath::SafeUrlPath;
+use async_recursion::async_recursion;
+pub use async_trait::async_trait;
+pub use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use futures_core::Stream;
 use log::warn;
 use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use schema::RemoteSessions;
 use snafu::{ensure, OptionExt, ResultExt};
 use std::collections::HashMap;
-use std::fs::create_dir_all;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
+use tokio::fs::{canonicalize, create_dir_all};
+use tokio::io::AsyncWriteExt;
 use url::Url;
 
 /// Represents whether a Repository should fail to load when metadata is expired (`Safe`) or whether
@@ -113,7 +122,6 @@ impl From<ExpirationEnforcement> for bool {
 /// ## Basic usage:
 ///
 /// ```rust
-/// # use std::fs::File;
 /// # use std::path::PathBuf;
 /// # use tough::RepositoryLoader;
 /// # use url::Url;
@@ -121,21 +129,23 @@ impl From<ExpirationEnforcement> for bool {
 /// # let root = dir.join("metadata").join("1.root.json");
 /// # let metadata_base_url = Url::from_file_path(dir.join("metadata")).unwrap();
 /// # let targets_base_url = Url::from_file_path(dir.join("targets")).unwrap();
+/// # tokio_test::block_on(async {
 ///
 /// let repository = RepositoryLoader::new(
-///     File::open(root).unwrap(),
+///     &tokio::fs::read(root).await.unwrap(),
 ///     metadata_base_url,
 ///     targets_base_url,
 /// )
 /// .load()
+/// .await
 /// .unwrap();
 ///
+/// # });
 /// ```
 ///
 /// ## With optional settings:
 ///
 /// ```rust
-/// # use std::fs::File;
 /// # use std::path::PathBuf;
 /// # use tough::{RepositoryLoader, FilesystemTransport, ExpirationEnforcement};
 /// # use url::Url;
@@ -143,24 +153,24 @@ impl From<ExpirationEnforcement> for bool {
 /// # let root = dir.join("metadata").join("1.root.json");
 /// # let metadata_base_url = Url::from_file_path(dir.join("metadata")).unwrap();
 /// # let targets_base_url = Url::from_file_path(dir.join("targets")).unwrap();
+/// # tokio_test::block_on(async {
 ///
 /// let repository = RepositoryLoader::new(
-///     File::open(root).unwrap(),
+///     &tokio::fs::read(root).await.unwrap(),
 ///     metadata_base_url,
 ///     targets_base_url,
 /// )
 /// .transport(FilesystemTransport)
 /// .expiration_enforcement(ExpirationEnforcement::Unsafe)
 /// .load()
+/// .await
 /// .unwrap();
 ///
+/// # });
 /// ```
 #[derive(Debug, Clone)]
-pub struct RepositoryLoader<R>
-where
-    R: Read,
-{
-    root: R,
+pub struct RepositoryLoader<'a> {
+    root: &'a [u8],
     metadata_base_url: Url,
     targets_base_url: Url,
     transport: Option<Box<dyn Transport + Send + Sync>>,
@@ -169,19 +179,19 @@ where
     expiration_enforcement: Option<ExpirationEnforcement>,
 }
 
-impl<R: Read> RepositoryLoader<R> {
+impl<'a> RepositoryLoader<'a> {
     /// Create a new `RepositoryLoader`.
     ///
-    /// `root` is a [`Read`]er for the trusted root metadata file, which you must ship with your
+    /// `root` is the content of a trusted root metadata file, which you must ship with your
     /// software using an out-of-band process. It should be a copy of the most recent root.json
     /// from your repository. (It's okay if it becomes out of date later; the client establishes
     /// trust up to the most recent root.json file.)
     ///
     /// `metadata_base_url` and `targets_base_url` are the base URLs where the client can find
     /// metadata (such as root.json) and targets (as listed in targets.json).
-    pub fn new(root: R, metadata_base_url: Url, targets_base_url: Url) -> Self {
+    pub fn new(root: &'a impl AsRef<[u8]>, metadata_base_url: Url, targets_base_url: Url) -> Self {
         Self {
-            root,
+            root: root.as_ref(),
             metadata_base_url,
             targets_base_url,
             transport: None,
@@ -192,13 +202,13 @@ impl<R: Read> RepositoryLoader<R> {
     }
 
     /// Load and verify TUF repository metadata.
-    pub fn load(self) -> Result<Repository> {
-        Repository::load(self)
+    pub async fn load(self) -> Result<Repository> {
+        Repository::load(self).await
     }
 
     /// Load and verify Uptane repository metadata.
-    pub fn load_uptane(self) -> Result<UptaneRepository> {
-        UptaneRepository::load(self)
+    pub async fn load_uptane(self) -> Result<UptaneRepository> {
+        UptaneRepository::load(self).await
     }    
 
     /// Set the transport. If no transport has been set, [`DefaultTransport`] will be used.
@@ -326,7 +336,7 @@ pub struct UptaneRepository {
 }
 
 impl UptaneRepository {
-    fn load<R: Read>(loader: RepositoryLoader<R>) -> Result<UptaneRepository> {
+    async fn load(loader: RepositoryLoader<'_>) -> Result<UptaneRepository> {
         let datastore = Datastore::new(loader.datastore)?;
         let transport = loader
             .transport
@@ -344,7 +354,7 @@ impl UptaneRepository {
             limits.max_root_updates,
             &metadata_base_url,
             expiration_enforcement,
-        )?;
+        ).await?;
 
         let remote_sessions = match root.signed.roles.get(&RoleType::RemoteSessions) {
             Some(_) => load_remote_sessions(
@@ -354,7 +364,7 @@ impl UptaneRepository {
                 limits.max_timestamp_size,
                 &metadata_base_url,
                 expiration_enforcement
-            ).map_err(|err|
+            ).await.map_err(|err|
                 format!("{}", err)
             ),
             None =>
@@ -382,7 +392,7 @@ impl UptaneRepository {
 impl Repository {
 
     /// Load and verify TUF repository metadata using a [`RepositoryLoader`] for the settings.
-    fn load<R: Read>(loader: RepositoryLoader<R>) -> Result<Self> {
+    async fn load(loader: RepositoryLoader<'_>) -> Result<Self> {
         let datastore = Datastore::new(loader.datastore)?;
         let transport = loader
             .transport
@@ -401,7 +411,8 @@ impl Repository {
             limits.max_root_updates,
             &metadata_base_url,
             expiration_enforcement,
-        )?;
+        )
+        .await?;
 
         // 2. Download the timestamp metadata file
         let timestamp = load_timestamp(
@@ -411,7 +422,8 @@ impl Repository {
             limits.max_timestamp_size,
             &metadata_base_url,
             expiration_enforcement,
-        )?;
+        )
+        .await?;
 
         // 3. Download the snapshot metadata file
         let snapshot = load_snapshot(
@@ -421,7 +433,8 @@ impl Repository {
             &datastore,
             &metadata_base_url,
             expiration_enforcement,
-        )?;
+        )
+        .await?;
 
         // 4. Download the targets metadata file
         let targets = load_targets(
@@ -432,7 +445,8 @@ impl Repository {
             limits.max_targets_size,
             &metadata_base_url,
             expiration_enforcement,
-        )?;
+        )
+        .await?;
 
         let expires_iter = [
             (root.signed.expires, RoleType::Root),
@@ -492,15 +506,19 @@ impl Repository {
     ///
     /// If the requested target is not listed in the repository metadata, `Ok(None)` is returned.
     ///
-    /// Otherwise, a reader is returned, which provides streaming access to the target contents
-    /// before its checksum is validated. If the maximum size is reached or there is a checksum
-    /// mismatch, the reader returns a [`std::io::Error`]. **Consumers of this library must not use
-    /// data from the reader if it returns an error.**
-    pub fn read_target(&self, name: &TargetName) -> Result<Option<impl Read + Send + '_>> {
+    /// Otherwise, a stream is returned, which provides access to the target contents before its
+    /// checksum is validated. If the maximum size is reached or there is a checksum mismatch, the
+    /// stream returns a [`error::Error`]. **Consumers of this library must not use data from the
+    /// stream if it returns an error.**
+    pub async fn read_target(
+        &self,
+        name: &TargetName,
+    ) -> Result<Option<impl Stream<Item = error::Result<Bytes>> + IntoVec<error::Error> + Send>>
+    {
         // Check for repository metadata expiration.
         if self.expiration_enforcement == ExpirationEnforcement::Safe {
             ensure!(
-                self.datastore.system_time()? < self.earliest_expiration,
+                self.datastore.system_time().await? < self.earliest_expiration,
                 error::ExpiredMetadataSnafu {
                     role: self.earliest_expiration_role
                 }
@@ -526,7 +544,7 @@ impl Repository {
         //   non-volatile storage as FILENAME.EXT.
         Ok(if let Ok(target) = self.targets.signed.find_target(name) {
             let (sha256, file) = self.target_digest_and_filename(target, name);
-            Some(self.fetch_target(target, &sha256, file.as_str())?)
+            Some(self.fetch_target(target, &sha256, file.as_str()).await?)
         } else {
             None
         })
@@ -549,17 +567,17 @@ impl Repository {
     /// - Will error if the result of path resolution results in a filepath outside of `outdir` or
     ///   outside of a delegated target's correct path of delegation.
     ///
-    pub fn save_target<P>(&self, name: &TargetName, outdir: P, prepend: Prefix) -> Result<()>
+    pub async fn save_target<P>(&self, name: &TargetName, outdir: P, prepend: Prefix) -> Result<()>
     where
         P: AsRef<Path>,
     {
         // Ensure the outdir exists then canonicalize the path.
         let outdir = outdir.as_ref();
-        let outdir = outdir
-            .canonicalize()
+        let outdir = canonicalize(outdir)
+            .await
             .context(error::SaveTargetOutdirCanonicalizeSnafu { path: outdir })?;
         ensure!(
-            outdir.is_dir(),
+            is_dir(&outdir).await,
             error::SaveTargetOutdirSnafu { path: outdir }
         );
 
@@ -609,17 +627,37 @@ impl Repository {
         );
 
         // Fetch and write the target using NamedTempFile for an atomic file creation.
-        let mut reader = self
-            .read_target(name)?
+        let mut stream = self
+            .read_target(name)
+            .await?
             .with_context(|| error::SaveTargetNotFoundSnafu { name: name.clone() })?;
-        create_dir_all(filepath_dir).context(error::DirCreateSnafu {
-            path: &filepath_dir,
-        })?;
-        let mut f =
-            NamedTempFile::new_in(filepath_dir).context(error::NamedTempFileCreateSnafu {
+        create_dir_all(filepath_dir)
+            .await
+            .context(error::DirCreateSnafu {
                 path: &filepath_dir,
             })?;
-        std::io::copy(&mut reader, &mut f).context(error::FileWriteSnafu { path: &f.path() })?;
+
+        // Create a new temporary file.
+        let tmp_path = filepath_dir.to_owned();
+        let tmp = tokio::task::spawn_blocking(move || NamedTempFile::new_in(tmp_path))
+            .await
+            // We do not cancel the task nor do we expect it to panic
+            .unwrap_or_else(|_| unreachable!())
+            .context(error::NamedTempFileCreateSnafu { path: filepath_dir })?;
+
+        // Convert to `tokio::fs::File`.
+        let (f, tmp_path) = tmp.into_parts();
+        let mut f = tokio::fs::File::from_std(f);
+
+        // Write input stream to file.
+        while let Some(bytes) = stream.next().await {
+            f.write_all(bytes?.as_ref())
+                .await
+                .context(error::FileWriteSnafu { path: &tmp_path })?;
+        }
+
+        // Reconstruct `NamedTempFile` in order to persist it at the target location.
+        let f = NamedTempFile::from_parts(f.into_std().await, tmp_path);
         f.persist(&resolved_filepath)
             .context(error::NamedTempFilePersistSnafu {
                 path: resolved_filepath,
@@ -659,9 +697,9 @@ pub(crate) fn encode_filename<S: AsRef<str>>(name: S) -> String {
 
 /// TUF v1.0.16, 5.2.9, 5.3.3, 5.4.5, 5.5.4, The expiration timestamp in the `[metadata]` file MUST
 /// be higher than the fixed update start time.
-fn check_expired<T: Role>(datastore: &Datastore, role: &T) -> Result<()> {
+async fn check_expired<T: Role>(datastore: &Datastore, role: &T) -> Result<()> {
     ensure!(
-        datastore.system_time()? <= role.expires(),
+        datastore.system_time().await? <= role.expires(),
         error::ExpiredMetadataSnafu { role: T::TYPE }
     );
     Ok(())
@@ -682,7 +720,7 @@ fn parse_url(url: Url) -> Result<Url> {
 
 /// Steps 0 and 1 of the client application, which load the current root metadata file based on a
 /// trusted root metadata file.
-fn load_root<R: Read>(
+async fn load_root<R: AsRef<[u8]>>(
     transport: &dyn Transport,
     root: R,
     datastore: &Datastore,
@@ -696,7 +734,7 @@ fn load_root<R: Read>(
     //    that the expiration of the trusted root metadata file does not matter, because we will
     //    attempt to update it in the next step.
     let mut root: Signed<Root> =
-        serde_json::from_reader(root).context(error::ParseTrustedMetadataSnafu)?;
+        serde_json::from_slice(root.as_ref()).context(error::ParseTrustedMetadataSnafu)?;
     root.signed
         .verify_role(&root)
         .context(error::VerifyTrustedMetadataSnafu)?;
@@ -737,19 +775,29 @@ fn load_root<R: Read>(
             error::MaxUpdatesExceededSnafu { max_root_updates }
         );
         let path = format!("{}.root.json", root.signed.version.get() + 1);
+        let url = metadata_base_url
+            .join(&path)
+            .with_context(|_| error::JoinUrlSnafu {
+                path: path.clone(),
+                url: metadata_base_url.clone(),
+            })?;
         match fetch_max_size(
             transport,
-            metadata_base_url.join(&path).context(error::JoinUrlSnafu {
-                path,
-                url: metadata_base_url.clone(),
-            })?,
+            url.clone(),
             max_root_size,
             "max_root_size argument",
-        ) {
+        )
+        .await
+        {
             Err(_) => break, // If this file is not available, then go to step 1.8.
-            Ok(reader) => {
+            Ok(stream) => {
+                let data = match stream.into_vec().await {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == TransportErrorKind::FileNotFound => break,
+                    err @ Err(_) => err.context(error::TransportSnafu { url })?,
+                };
                 let new_root: Signed<Root> =
-                    serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+                    serde_json::from_slice(&data).context(error::ParseMetadataSnafu {
                         role: RoleType::Root,
                     })?;
 
@@ -817,7 +865,7 @@ fn load_root<R: Read>(
     // file has expired, abort the update cycle, report the potential freeze attack. On the next
     // update cycle, begin at step 5.1 and version N of the root metadata file.
     if expiration_enforcement == ExpirationEnforcement::Safe {
-        check_expired(datastore, &root.signed)?;
+        check_expired(datastore, &root.signed).await?;
     }
 
     // 1.9. If the timestamp and / or snapshot keys have been rotated, then delete the trusted
@@ -833,8 +881,8 @@ fn load_root<R: Read>(
             .iter()
             .ne(root.signed.keys(RoleType::Snapshot))
     {
-        let r1 = datastore.remove("timestamp.json");
-        let r2 = datastore.remove("snapshot.json");
+        let r1 = datastore.remove("timestamp.json").await;
+        let r2 = datastore.remove("snapshot.json").await;
         r1.and(r2)?;
     }
 
@@ -848,7 +896,7 @@ fn load_root<R: Read>(
 }
 
 /// Step 2 of the client application, which loads the timestamp metadata file.
-fn load_timestamp(
+async fn load_timestamp(
     transport: &dyn Transport,
     root: &Signed<Root>,
     datastore: &Datastore,
@@ -861,17 +909,25 @@ fn load_timestamp(
     //    example, Y may be tens of kilobytes. The filename used to download the timestamp metadata
     //    file is of the fixed form FILENAME.EXT (e.g., timestamp.json).
     let path = "timestamp.json";
-    let reader = fetch_max_size(
-        transport,
-        metadata_base_url.join(path).context(error::JoinUrlSnafu {
+    let url = metadata_base_url
+        .join(path)
+        .with_context(|_| error::JoinUrlSnafu {
             path,
             url: metadata_base_url.clone(),
-        })?,
+        })?;
+    let stream = fetch_max_size(
+        transport,
+        url.clone(),
         max_timestamp_size,
         "max_timestamp_size argument",
-    )?;
+    )
+    .await?;
+    let data = stream
+        .into_vec()
+        .await
+        .context(error::TransportSnafu { url })?;
     let timestamp: Signed<Timestamp> =
-        serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+        serde_json::from_slice(&data).context(error::ParseMetadataSnafu {
             role: RoleType::Timestamp,
         })?;
 
@@ -889,8 +945,9 @@ fn load_timestamp(
     //   file. If the new timestamp metadata file is older than the trusted timestamp metadata
     //   file, discard it, abort the update cycle, and report the potential rollback attack.
     if let Some(Ok(old_timestamp)) = datastore
-        .reader("timestamp.json")?
-        .map(serde_json::from_reader::<_, Signed<Timestamp>>)
+        .bytes("timestamp.json")
+        .await?
+        .map(|b| serde_json::from_slice::<Signed<Timestamp>>(&b))
     {
         if root.signed.verify_role(&old_timestamp).is_ok() {
             ensure!(
@@ -909,17 +966,17 @@ fn load_timestamp(
     // metadata file becomes the trusted timestamp metadata file. If the new timestamp metadata file
     // has expired, discard it, abort the update cycle, and report the potential freeze attack.
     if expiration_enforcement == ExpirationEnforcement::Safe {
-        check_expired(datastore, &timestamp.signed)?;
+        check_expired(datastore, &timestamp.signed).await?;
     }
 
     // Now that everything seems okay, write the timestamp file to the datastore.
-    datastore.create("timestamp.json", &timestamp)?;
+    datastore.create("timestamp.json", &timestamp).await?;
 
     Ok(timestamp)
 }
 
 /// Step 3 of the client application, which loads the snapshot metadata file.
-fn load_snapshot(
+async fn load_snapshot(
     transport: &dyn Transport,
     root: &Signed<Root>,
     timestamp: &Signed<Timestamp>,
@@ -948,18 +1005,26 @@ fn load_snapshot(
     } else {
         "snapshot.json".to_owned()
     };
-    let reader = fetch_sha256(
-        transport,
-        metadata_base_url.join(&path).context(error::JoinUrlSnafu {
-            path,
+    let url = metadata_base_url
+        .join(&path)
+        .with_context(|_| error::JoinUrlSnafu {
+            path: path.clone(),
             url: metadata_base_url.clone(),
-        })?,
+        })?;
+    let stream = fetch_sha256(
+        transport,
+        url.clone(),
         snapshot_meta.length,
         "timestamp.json",
         &snapshot_meta.hashes.sha256,
-    )?;
+    )
+    .await?;
+    let data = stream
+        .into_vec()
+        .await
+        .context(error::TransportSnafu { url })?;
     let snapshot: Signed<Snapshot> =
-        serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+        serde_json::from_slice(&data).context(error::ParseMetadataSnafu {
             role: RoleType::Snapshot,
         })?;
 
@@ -993,8 +1058,9 @@ fn load_snapshot(
     // 3.3.1. Note that the trusted snapshot metadata file may be checked for authenticity, but its
     //   expiration does not matter for the following purposes.
     if let Some(Ok(old_snapshot)) = datastore
-        .reader("snapshot.json")?
-        .map(serde_json::from_reader::<_, Signed<Snapshot>>)
+        .bytes("snapshot.json")
+        .await?
+        .map(|b| serde_json::from_slice::<Signed<Snapshot>>(&b))
     {
         // 3.3.2. The version number of the trusted snapshot metadata file, if any, MUST be less
         //   than or equal to the version number of the new snapshot metadata file. If the new
@@ -1015,7 +1081,7 @@ fn load_snapshot(
             //   less than or equal to its version number in the new snapshot metadata file.
             //   Furthermore, any targets metadata filename that was listed in the trusted snapshot
             //   metadata file, if any, MUST continue to be listed in the new snapshot metadata
-            //   file. If any of these conditions are not met, discard the new snaphot metadadata
+            //   file. If any of these conditions are not met, discard the new snapshot metadata
             //   file, abort the update cycle, and report the failure.
             if let Some(old_targets_meta) = old_snapshot.signed.meta.get("targets.json") {
                 let targets_meta =
@@ -1044,17 +1110,17 @@ fn load_snapshot(
     // metadata file becomes the trusted snapshot metadata file. If the new snapshot metadata file
     // is expired, discard it, abort the update cycle, and report the potential freeze attack.
     if expiration_enforcement == ExpirationEnforcement::Safe {
-        check_expired(datastore, &snapshot.signed)?;
+        check_expired(datastore, &snapshot.signed).await?;
     }
 
     // Now that everything seems okay, write the snapshot file to the datastore.
-    datastore.create("snapshot.json", &snapshot)?;
+    datastore.create("snapshot.json", &snapshot).await?;
 
     Ok(snapshot)
 }
 
 /// Step 4 of the client application, which loads the targets metadata file.
-fn load_targets(
+async fn load_targets(
     transport: &dyn Transport,
     root: &Signed<Root>,
     snapshot: &Signed<Snapshot>,
@@ -1086,32 +1152,34 @@ fn load_targets(
     } else {
         "targets.json".to_owned()
     };
-    let targets_url = metadata_base_url.join(&path).context(error::JoinUrlSnafu {
-        path,
-        url: metadata_base_url.clone(),
-    })?;
+    let targets_url = metadata_base_url
+        .join(&path)
+        .with_context(|_| error::JoinUrlSnafu {
+            path,
+            url: metadata_base_url.clone(),
+        })?;
     let (max_targets_size, specifier) = match targets_meta.length {
         Some(length) => (length, "snapshot.json"),
         None => (max_targets_size, "max_targets_size parameter"),
     };
-    let reader = if let Some(hashes) = &targets_meta.hashes {
-        Box::new(fetch_sha256(
+    let stream = if let Some(hashes) = &targets_meta.hashes {
+        fetch_sha256(
             transport,
-            targets_url,
+            targets_url.clone(),
             max_targets_size,
             specifier,
             &hashes.sha256,
-        )?) as Box<dyn Read>
+        )
+        .await?
     } else {
-        Box::new(fetch_max_size(
-            transport,
-            targets_url,
-            max_targets_size,
-            specifier,
-        )?)
+        fetch_max_size(transport, targets_url.clone(), max_targets_size, specifier).await?
     };
+    let data = stream
+        .into_vec()
+        .await
+        .context(error::TransportSnafu { url: targets_url })?;
     let mut targets: Signed<crate::schema::Targets> =
-        serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+        serde_json::from_slice(&data).context(error::ParseMetadataSnafu {
             role: RoleType::Targets,
         })?;
 
@@ -1145,8 +1213,9 @@ fn load_targets(
     //   If the new targets metadata file is older than the trusted targets metadata file, discard
     //   it, abort the update cycle, and report the potential rollback attack.
     if let Some(Ok(old_targets)) = datastore
-        .reader("targets.json")?
-        .map(serde_json::from_reader::<_, Signed<crate::schema::Targets>>)
+        .bytes("targets.json")
+        .await?
+        .map(|b| serde_json::from_slice::<Signed<crate::schema::Targets>>(&b))
     {
         if root.signed.verify_role(&old_targets).is_ok() {
             ensure!(
@@ -1165,11 +1234,11 @@ fn load_targets(
     // metadata file becomes the trusted targets metadata file. If the new targets metadata file is
     // expired, discard it, abort the update cycle, and report the potential freeze attack.
     if expiration_enforcement == ExpirationEnforcement::Safe {
-        check_expired(datastore, &targets.signed)?;
+        check_expired(datastore, &targets.signed).await?;
     }
 
     // Now that everything seems okay, write the targets file to the datastore.
-    datastore.create("targets.json", &targets)?;
+    datastore.create("targets.json", &targets).await?;
 
     // 4.5. Perform a preorder depth-first search for metadata about the desired target, beginning
     //   with the top-level targets role.
@@ -1182,7 +1251,8 @@ fn load_targets(
             max_targets_size,
             delegations,
             datastore,
-        )?;
+        )
+        .await?;
     }
 
     // This validation can only be done from the top level targets.json role. This check verifies
@@ -1192,7 +1262,8 @@ fn load_targets(
 }
 
 // Follow the paths of delegations starting with the top level targets.json delegation
-fn load_delegations(
+#[async_recursion]
+async fn load_delegations(
     transport: &dyn Transport,
     snapshot: &Signed<Snapshot>,
     consistent_snapshot: bool,
@@ -1209,7 +1280,7 @@ fn load_delegations(
             .signed
             .meta
             .get(&format!("{}.json", &delegated_role.name))
-            .context(error::RoleNotInMetaSnafu {
+            .with_context(|| error::RoleNotInMetaSnafu {
                 name: delegated_role.name.clone(),
             })?;
 
@@ -1222,21 +1293,23 @@ fn load_delegations(
         } else {
             format!("{}.json", encode_filename(&delegated_role.name))
         };
-        let role_url = metadata_base_url.join(&path).context(error::JoinUrlSnafu {
-            path: path.clone(),
-            url: metadata_base_url.clone(),
-        })?;
+        let role_url = metadata_base_url
+            .join(&path)
+            .with_context(|_| error::JoinUrlSnafu {
+                path: path.clone(),
+                url: metadata_base_url.clone(),
+            })?;
         let specifier = "max_targets_size parameter";
         // load the role json file
-        let reader = Box::new(fetch_max_size(
-            transport,
-            role_url,
-            max_targets_size,
-            specifier,
-        )?);
+        let stream =
+            fetch_max_size(transport, role_url.clone(), max_targets_size, specifier).await?;
+        let data = stream
+            .into_vec()
+            .await
+            .context(error::TransportSnafu { url: role_url })?;
         // since each role is a targets, we load them as such
         let role: Signed<crate::schema::Targets> =
-            serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+            serde_json::from_slice(&data).context(error::ParseMetadataSnafu {
                 role: RoleType::Targets,
             })?;
         // verify each role with the delegation
@@ -1254,16 +1327,17 @@ fn load_delegations(
             }
         );
 
-        datastore.create(&path, &role)?;
+        datastore.create(&path, &role).await?;
         delegated_roles.insert(delegated_role.name.clone(), Some(role));
     }
     // load all roles delegated by this role
     for delegated_role in &mut delegation.roles {
-        delegated_role.targets = delegated_roles.remove(&delegated_role.name).context(
-            error::DelegatedRolesNotConsistentSnafu {
-                name: delegated_role.name.clone(),
-            },
-        )?;
+        delegated_role.targets =
+            delegated_roles
+                .remove(&delegated_role.name)
+                .with_context(|| error::DelegatedRolesNotConsistentSnafu {
+                    name: delegated_role.name.clone(),
+                })?;
         if let Some(targets) = &mut delegated_role.targets {
             if let Some(delegations) = &mut targets.signed.delegations {
                 load_delegations(
@@ -1274,14 +1348,16 @@ fn load_delegations(
                     max_targets_size,
                     delegations,
                     datastore,
-                )?;
+                )
+                .await?;
             }
         }
     }
     Ok(())
 }
 
-fn load_remote_sessions(
+
+async fn load_remote_sessions(
     transport: &dyn Transport,
     root: &Signed<Root>,
     datastore: &Datastore,
@@ -1298,14 +1374,14 @@ fn load_remote_sessions(
         })?,
         max_remote_sessions_size,
         "max_timestamp_size argument",
-    )?;
-
+    ).await?.into_vec().await.context(error::TransportSnafu { url: metadata_base_url.clone()})?;
 
     let remote_sessions: Signed<RemoteSessions> =
-        serde_json::from_reader(reader).context(error::ParseMetadataSnafu {
+        serde_json::from_slice(&reader).context(error::ParseMetadataSnafu {
             role: RoleType::RemoteSessions,
         })?;
 
+        
     root.signed
         .verify_role(&remote_sessions)
         .context(error::VerifyMetadataSnafu {
@@ -1314,8 +1390,8 @@ fn load_remote_sessions(
 
     // 2.2. Check for a rollback attack.
     if let Some(Ok(old_remote_sessions)) = datastore
-        .reader("remote-sessions.json")?
-        .map(serde_json::from_reader::<_, Signed<RemoteSessions>>)
+        .bytes("remote-sessions.json").await?
+        .map(|v| serde_json::from_slice::<Signed<RemoteSessions>>(&v))
     {
         if root.signed.verify_role(&old_remote_sessions).is_ok() {
             ensure!(
@@ -1331,10 +1407,10 @@ fn load_remote_sessions(
 
     // TUF v1.0.16, 5.3.3. Check for a freeze attack
     if expiration_enforcement == ExpirationEnforcement::Safe {
-        check_expired(datastore, &remote_sessions.signed)?;
+        check_expired(datastore, &remote_sessions.signed).await?;
     }
 
-    datastore.create("remote-sessions.json", &remote_sessions)?;
+    datastore.create("remote-sessions.json", &remote_sessions).await?;
 
     Ok(remote_sessions)
 }

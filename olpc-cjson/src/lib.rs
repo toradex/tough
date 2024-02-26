@@ -254,13 +254,13 @@ impl Formatter for CanonicalFormatter {
     }
 
     fn begin_object_key<W: Write + ?Sized>(&mut self, _writer: &mut W, _first: bool) -> Result<()> {
-        let mut object = self.obj_mut()?;
+        let object = self.obj_mut()?;
         object.key_done = false;
         Ok(())
     }
 
     fn end_object_key<W: Write + ?Sized>(&mut self, _writer: &mut W) -> Result<()> {
-        let mut object = self.obj_mut()?;
+        let object = self.obj_mut()?;
         object.key_done = true;
         Ok(())
     }
@@ -426,7 +426,7 @@ mod tests {
         Ok(())
     }
 
-    /// This test asserts that the cannonical representation of some real-world data always comes
+    /// This test asserts that the canonical representation of some real-world data always comes
     /// out the same.
     #[allow(clippy::unreadable_literal)]
     #[test]
