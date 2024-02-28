@@ -79,7 +79,7 @@ pub(crate) enum Error {
         backtrace: Backtrace,
     },
 
-    #[snafu(display("The a file or directory already exists at '{}'", path.display()))]
+    #[snafu(display("A file or directory already exists at '{}'", path.display()))]
     DownloadOutdirExists { path: PathBuf, backtrace: Backtrace },
 
     #[snafu(display(
@@ -126,6 +126,9 @@ pub(crate) enum Error {
         source: std::io::Error,
         backtrace: Backtrace,
     },
+
+    #[snafu(display("Can't build URL from path '{}'", path.display()))]
+    FileUrl { path: PathBuf, backtrace: Backtrace },
 
     #[snafu(display("Failed to write to {}: {}", path.display(), source))]
     FileWrite {
@@ -373,6 +376,12 @@ pub(crate) enum Error {
     #[snafu(display("Failed writing target data to disk: {}", source))]
     WriteTarget {
         source: std::io::Error,
+        backtrace: Backtrace,
+    },
+
+    #[snafu(display("Failed to join a task: {}", source))]
+    JoinTask {
+        source: tokio::task::JoinError,
         backtrace: Backtrace,
     },
 }

@@ -59,24 +59,30 @@ license-files = [
 # Deny multiple versions or wildcard dependencies.
 multiple-versions = "deny"
 wildcards = "deny"
+# failure-server is an internal package used only in testing that we do not want to publish to
+# crates.io. When including it in tough's dev dependencies, it is necessary to do so without a
+# version number or else cargo publish will fail. The lack of a version number causes cargo deny
+# to ban failure-server as a wildcard-versioned dependency. The following line allows us to refer
+# to our own internal packages without a version number.
+allow-wildcard-paths = true
 
 skip = [
+    # http-test is using an old version of bstr
+    { name = "bstr", version = "=0.2" },
     # num_cpus and clap is using old versions of hermit-abi
     { name = "hermit-abi" },
-    # pem and using an old version of base64
-    { name = "base64", version = "=0.13.1" },
-    # globset is using an old version of aho-corasick
-    { name = "aho-corasick", version = "=0.7.20" },
     # clap and other crates use an old version of syn
     { name = "syn", version = "=1" },
+    # several dependencies are using an old version of bitflags
+    { name = "bitflags", version = "=1.3" },
+    { name = "regex-automata", version = "=0.4" },
+    # several dependencies are using an old version of socket2
+    { name = "socket2", version = "=0.4" },
+    # noxious, used for testing, is using an old version of tokio-util
+    { name = "tokio-util", version = "=0.6.10" },
 ]
 
 skip-tree = [
-    # windows-sys is not a direct dependency. mio and schannel
-    # are using different versions of windows-sys. we skip the
-    # dependency tree because windows-sys has many sub-crates
-    # that differ in major version.
-    { name = "windows-sys", version = "=0.42" },
 ]
 
 [sources]

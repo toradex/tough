@@ -2,17 +2,19 @@
 
 //! Handles cryptographic keys and their serialization in TUF metadata files.
 
-use crate::schema::decoded::{Decoded, EcdsaFlex, Hex, RsaPem};
-use crate::schema::error::{self, Result};
-use olpc_cjson::CanonicalFormatter;
+use crate::schema::decoded::{Decoded, EcdsaFlex, Hex, RsaPem, Encode};
+use crate::schema::error::Result;
 use ring::digest::{digest, SHA256};
-use ring::signature::VerificationAlgorithm;
+use ring::signature::{VerificationAlgorithm};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use snafu::ResultExt;
+
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use snafu::OptionExt;
+use super::error;
+
 
 /// Serializes signing keys as defined by the TUF specification. All keys have the format
 /// ```json
@@ -34,7 +36,8 @@ use std::str::FromStr;
 ///  * `Ed25519`: PUBLIC is a 64-byte hex encoded string.
 ///  * `Ecdsa`: PUBLIC is in PEM format and a string.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
+// TRX We use SCREAMING-KEBAB-CASE
+#[serde(rename_all = "SCREAMING-KEBAB-CASE")]
 #[serde(tag = "keytype")]
 pub enum Key {
     /// An RSA key.
@@ -42,6 +45,8 @@ pub enum Key {
         /// The RSA key.
         keyval: RsaKey,
         /// Denotes the key's signature scheme.
+        // TRX: We don't use this field, need to skip serializing when generating canonical jon
+        #[serde(skip)]
         scheme: RsaScheme,
         /// Any additional fields read during deserialization; will not be used.
         #[serde(flatten)]
@@ -52,6 +57,8 @@ pub enum Key {
         /// The Ed25519 key.
         keyval: Ed25519Key,
         /// Denotes the key's signature scheme.
+        // TRX: We don't use this field, need to skip serializing when generating canonical jon
+        #[serde(skip)]
         scheme: Ed25519Scheme,
         /// Any additional fields read during deserialization; will not be used.
         #[serde(flatten)]
@@ -78,6 +85,13 @@ pub enum RsaScheme {
     RsassaPssSha256,
 }
 
+// TRX: Required to skip (de)serializing
+impl Default for RsaScheme {
+    fn default() -> Self {
+        RsaScheme::RsassaPssSha256
+    }
+}
+
 /// Represents a deserialized (decoded) RSA public key.
 #[derive(Debug, Clone, Deserialize, Serialize, Eq, PartialEq)]
 pub struct RsaKey {
@@ -95,6 +109,13 @@ pub struct RsaKey {
 pub enum Ed25519Scheme {
     /// 'ed25519': Elliptic curve digital signature algorithm based on Twisted Edwards curves.
     Ed25519,
+}
+
+// TRX: Required to skip (de)serializing
+impl Default for Ed25519Scheme {
+    fn default() -> Self {
+        Ed25519Scheme::Ed25519
+    }
 }
 
 /// Represents a deserialized (decoded) Ed25519 public key.
@@ -130,14 +151,49 @@ pub struct EcdsaKey {
 
 impl Key {
     /// Calculate the key ID for this key.
+    // TRX For legacy reasons, we calculate key ids based on the getEncoded/getAByte 
+    // methods in sun.security.rsa.RSAPublicKeyImpl and net.i2p.crypto.eddsa.EdDSAPublicKey respectively,
+    // so we need to do the same here, instead of using the cjson representation
     pub fn key_id(&self) -> Result<Decoded<Hex>> {
-        let mut buf = Vec::new();
-        let mut ser = serde_json::Serializer::with_formatter(&mut buf, CanonicalFormatter::new());
-        self.serialize(&mut ser)
-            .context(error::JsonSerializationSnafu {
-                what: "key".to_owned(),
-            })?;
-        Ok(digest(&SHA256, &buf).as_ref().to_vec().into())
+
+        let keyval: Vec<u8> = match self {
+            Key::Ecdsa {
+                keyval,
+                ..
+            } =>
+                keyval.public.to_vec(),
+            Key::Ed25519 {
+                keyval,
+                ..
+            } =>{
+                let mut der_encoded = Vec::with_capacity(44);
+
+                der_encoded.push(0x30);
+                der_encoded.push((10 + keyval.public.len()) as u8);
+                der_encoded.extend(&[0x30, 5, 0x06, 3, 43, 101, 112, 0x03, 1 + keyval.public.len() as u8, 0]);
+                der_encoded.extend(keyval.public.iter());
+
+                der_encoded
+            },
+            Key::Rsa {
+                keyval,
+                ..
+            } => {
+                let as_pem = RsaPem::encode(&keyval.public);
+                let (_, as_der) = spki::Document::from_pem(&as_pem).ok().context(error::SpkiDecodeSnafu)?;
+                as_der.to_vec()
+            },
+        };
+
+        // TRX: See comment on key_id, we dont use cjson to calculate key_id
+        // let mut buf = Vec::new();
+        // let mut ser = serde_json::Serializer::with_formatter(&mut buf, CanonicalFormatter::new());
+        // self.serialize(&mut ser)
+        //     .context(error::JsonSerializationSnafu {
+        //         what: "key".to_owned(),
+        //     })?;
+
+        Ok(digest(&SHA256, &keyval).as_ref().to_vec().into())
     }
 
     /// Verify a signature of an object made with this key.

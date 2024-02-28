@@ -57,9 +57,9 @@ tuftool root set-threshold "${ROOT}" timestamp 1
 tuftool root gen-rsa-key "${ROOT}" "${WRK}/keys/root.pem" --role root
 
 # for this example we will re-use the same key for the other standard roles
-tuftool root add-key "${ROOT}" "${WRK}/keys/root.pem" --role snapshot
-tuftool root add-key "${ROOT}" "${WRK}/keys/root.pem" --role targets
-tuftool root add-key "${ROOT}" "${WRK}/keys/root.pem" --role timestamp
+tuftool root add-key "${ROOT}" -k "${WRK}/keys/root.pem" --role snapshot
+tuftool root add-key "${ROOT}" -k "${WRK}/keys/root.pem" --role targets
+tuftool root add-key "${ROOT}" -k "${WRK}/keys/root.pem" --role timestamp
 
 # sign root.json
 tuftool root sign "${ROOT}" -k "${WRK}/keys/root.pem"
@@ -123,7 +123,7 @@ Download command is usually used to download a remote repo using HTTP/S url, but
 for this example we will use a file based url to download from local repo.
 
 ```sh
-# downlaod tuf repo
+# download tuf repo
 tuftool download \
    --root "${ROOT}" \
    -t "file://${WRK}/tuf-repo/targets" \
@@ -134,6 +134,25 @@ tuftool download \
 ## HTTP Proxy Support
 
 `tuftool` respects the `HTTPS_PROXY` and `NO_PROXY` environment variables.
+
+## Container
+
+You can build a simple container image to avoid needing to install the Rust toolchain and dependencies or your local machine.
+
+To build the image use Docker or Finch (same argument syntax, just replace 
+`docker` for `finch`):
+
+```shell
+docker build -t tuftool .
+```
+
+To use tuftool, mount the host working directory to `/share`.
+
+For example, to mount the current directory for `download` you would do something like:
+
+```shell
+docker run -it -v $(pwd):/share tuftool download "/share/some_directory" ...
+```
 
 ## Testing
 
