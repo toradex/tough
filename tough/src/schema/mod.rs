@@ -371,6 +371,10 @@ pub struct RemoteSessions {
     /// A json blob describing the allowed remote sessions
     pub remote_sessions: Value,
 
+    /// A json blob describing the allowed remote sessions    
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_commands: Option<Value>,
+
     /// Determines when metadata should be considered expired and no longer trusted by clients.
     pub expires: DateTime<Utc>,
 
