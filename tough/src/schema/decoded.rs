@@ -68,6 +68,25 @@ pub trait Encode {
     fn encode(b: &[u8]) -> String;
 }
 
+
+/// [`Decode`]/[`Encode`] implementation for base64-encoded strings.
+#[derive(Debug, Clone, Copy)]
+pub struct Base64;
+
+use base64::prelude::{Engine as _, BASE64_STANDARD};
+
+impl Decode for Base64 {
+    fn decode(s: &str) -> Result<Vec<u8>, Error> {
+        BASE64_STANDARD.decode(s).context(error::Base64DecodeSnafu)
+    }
+}
+
+impl Encode for Base64 {
+    fn encode(b: &[u8]) -> String {
+        BASE64_STANDARD.encode(b)
+    }
+}
+
 /// [`Decode`]/[`Encode`] implementation for hex-encoded strings.
 #[derive(Debug, Clone, Copy)]
 pub struct Hex;

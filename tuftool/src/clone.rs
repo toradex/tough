@@ -6,7 +6,6 @@ use crate::download_root::download_root;
 use crate::error::{self, Result};
 use clap::Parser;
 use snafu::ResultExt;
-use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use tough::{ExpirationEnforcement, RepositoryLoader};
@@ -14,49 +13,45 @@ use url::Url;
 
 #[derive(Debug, Parser)]
 pub(crate) struct CloneArgs {
-    /// Path to root.json file for the repository
-    #[clap(
-        short = 'r',
-        long = "root",
-        required_if("allow-root-download", "false")
-    )]
-    root: Option<PathBuf>,
-
-    /// Remote root.json version number
-    #[clap(short = 'v', long = "root-version", default_value = "1")]
-    root_version: NonZeroU64,
-
-    /// TUF repository metadata base URL
-    #[clap(short = 'm', long = "metadata-url")]
-    metadata_base_url: Url,
-
-    /// TUF repository targets base URL
-    #[clap(short = 't', long = "targets-url", required_unless = "metadata-only")]
-    targets_base_url: Option<Url>,
-
-    /// Allow downloading the root.json file (unsafe)
-    #[clap(long)]
-    allow_root_download: bool,
-
     /// Allow repo download for expired metadata (unsafe)
-    #[clap(long)]
+    #[arg(long)]
     allow_expired_repo: bool,
 
-    /// Download only these targets, if specified
-    #[clap(short = 'n', long = "target-names", conflicts_with = "metadata-only")]
-    target_names: Vec<String>,
-
-    /// Output directory of targets
-    #[clap(long, required_unless = "metadata-only")]
-    targets_dir: Option<PathBuf>,
+    /// Allow downloading the root.json file (unsafe)
+    #[arg(long)]
+    allow_root_download: bool,
 
     /// Output directory of metadata
-    #[clap(long)]
+    #[arg(long)]
     metadata_dir: PathBuf,
 
     /// Only download the repository metadata, not the targets
-    #[clap(long, conflicts_with_all(&["target-names", "targets-dir", "targets-base-url"]))]
+    #[arg(long, conflicts_with_all(&["target_names", "targets_dir", "targets_base_url"]))]
     metadata_only: bool,
+
+    /// TUF repository metadata base URL
+    #[arg(short, long = "metadata-url")]
+    metadata_base_url: Url,
+
+    /// Path to root.json file for the repository
+    #[arg(short, long, required_if_eq("allow_root_download", "false"))]
+    root: Option<PathBuf>,
+
+    /// Download only these targets, if specified
+    #[arg(short = 'n', long, conflicts_with = "metadata_only")]
+    target_names: Vec<String>,
+
+    /// Output directory of targets
+    #[arg(long, required_unless_present = "metadata_only")]
+    targets_dir: Option<PathBuf>,
+
+    /// TUF repository targets base URL
+    #[arg(short, long = "targets-url", required_unless_present = "metadata_only")]
+    targets_base_url: Option<Url>,
+
+    /// Remote root.json version number
+    #[arg(short = 'v', long, default_value = "1")]
+    root_version: NonZeroU64,
 }
 
 #[rustfmt::skip]
@@ -68,13 +63,13 @@ WARNING: repo metadata is expired, meaning the owner hasn't verified its content
 }
 
 impl CloneArgs {
-    pub(crate) fn run(&self) -> Result<()> {
+    pub(crate) async fn run(&self) -> Result<()> {
         // Use local root.json or download from repository
         let root_path = if let Some(path) = &self.root {
             PathBuf::from(path)
         } else if self.allow_root_download {
             let outdir = std::env::current_dir().context(error::CurrentDirSnafu)?;
-            download_root(&self.metadata_base_url, self.root_version, outdir)?
+            download_root(&self.metadata_base_url, self.root_version, outdir).await?
         } else {
             eprintln!("No root.json available");
             std::process::exit(1);
@@ -100,12 +95,15 @@ impl CloneArgs {
             ExpirationEnforcement::Safe
         };
         let repository = RepositoryLoader::new(
-            File::open(&root_path).context(error::OpenRootSnafu { path: &root_path })?,
+            &tokio::fs::read(&root_path)
+                .await
+                .context(error::OpenRootSnafu { path: &root_path })?,
             self.metadata_base_url.clone(),
             targets_base_url,
         )
         .expiration_enforcement(expiration_enforcement)
         .load()
+        .await
         .context(error::RepoLoadSnafu)?;
 
         // Clone the repository, downloading none, all, or a subset of targets
@@ -113,6 +111,7 @@ impl CloneArgs {
             println!("Cloning repository metadata to {:?}", self.metadata_dir);
             repository
                 .cache_metadata(&self.metadata_dir, true)
+                .await
                 .context(error::CloneRepositorySnafu)?;
         } else {
             // Similar to `targets_base_url, structopt's guard rails won't let us have a
@@ -129,6 +128,7 @@ impl CloneArgs {
             if self.target_names.is_empty() {
                 repository
                     .cache(&self.metadata_dir, targets_dir, None::<&[&str]>, true)
+                    .await
                     .context(error::CloneRepositorySnafu)?;
             } else {
                 repository
@@ -138,6 +138,7 @@ impl CloneArgs {
                         Some(self.target_names.as_slice()),
                         true,
                     )
+                    .await
                     .context(error::CloneRepositorySnafu)?;
             }
         };

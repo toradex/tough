@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2023-12-05
+
+### Changes
+- Dependency updates
+
+## [0.7.0] - 2023-11-07
+
+### Changes
+- ❗Breaking Change❗: The `KeySource` and `Sign` traits are now async [#687]
+- Expand AWS credential file support, e.g. enable `source_profile` and `credential_process` [#670]
+
+[#670]: https://github.com/awslabs/tough/pull/670
+[#687]: https://github.com/awslabs/tough/pull/687
+
+## [0.6.0] - 2023-08-22
+### Changes
+- Bump AWS SDK for Rust [#610]
+- Other dependency updates
+
+[#610]: https://github.com/awslabs/tough/pull/610
+
 ## [0.5.0] - 2023-03-02
 ### Changes
 - Replaced a deprecated function (aws_sdk_kms::Client::from_conf_conn) [#568]
@@ -107,7 +128,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Everything!
 
-[Unreleased]: https://github.com/awslabs/tough/compare/tough-kms-v0.5.0...develop
+[Unreleased]: https://github.com/awslabs/tough/compare/tough-kms-v0.8.0...develop
+[0.8.0]: https://github.com/awslabs/tough/compare/tough-kms-v0.7.0...tough-kms-v0.8.0
+[0.7.0]: https://github.com/awslabs/tough/compare/tough-kms-v0.6.0...tough-kms-v0.7.0
+[0.6.0]: https://github.com/awslabs/tough/compare/tough-kms-v0.5.0...tough-kms-v0.6.0
 [0.5.0]: https://github.com/awslabs/tough/compare/tough-kms-v0.4.2...tough-kms-v0.5.0
 [0.4.2]: https://github.com/awslabs/tough/compare/tough-kms-v0.4.1...tough-kms-v0.4.2
 [0.4.1]: https://github.com/awslabs/tough/compare/tough-kms-v0.4.0...tough-kms-v0.4.1

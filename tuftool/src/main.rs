@@ -26,19 +26,20 @@ mod remove_key_role;
 mod remove_role;
 mod root;
 mod source;
+mod transfer_metadata;
 mod update;
 mod update_targets;
 
 use crate::error::Result;
 use clap::Parser;
-use rayon::prelude::*;
+use futures::{StreamExt, TryStreamExt};
 use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 use snafu::{ErrorCompat, OptionExt, ResultExt};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use tempfile::NamedTempFile;
+use tokio::runtime::Handle;
 use tough::schema::Target;
 use tough::TargetName;
 use walkdir::WalkDir;
@@ -47,21 +48,17 @@ static SPEC_VERSION: &str = "1.0.0";
 
 /// This wrapper enables global options and initializes the logger before running any subcommands.
 #[derive(Parser)]
+#[command(version)]
 struct Program {
     /// Set logging verbosity [trace|debug|info|warn|error]
-    #[clap(
-        name = "log-level",
-        short = 'l',
-        long = "log-level",
-        default_value = "info"
-    )]
+    #[clap(name = "log-level", short, long, default_value = "info")]
     log_level: LevelFilter,
     #[clap(subcommand)]
     cmd: Command,
 }
 
 impl Program {
-    fn run(self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         TermLogger::init(
             self.log_level,
             ConfigBuilder::new()
@@ -72,91 +69,145 @@ impl Program {
             ColorChoice::Auto,
         )
         .context(error::LoggerSnafu)?;
-        self.cmd.run()
+        self.cmd.run().await
     }
 }
 
 #[derive(Debug, Parser)]
 enum Command {
+    /// Clone a TUF repository, including metadata and some or all targets
+    Clone(clone::CloneArgs),
     /// Create a TUF repository
     Create(create::CreateArgs),
+    /// Delegation Commands
+    Delegation(Delegation),
     /// Download a TUF repository's targets
     Download(download::DownloadArgs),
-    /// Update a TUF repository's metadata and optionally add targets
-    Update(Box<update::UpdateArgs>),
     /// Manipulate a root.json metadata file
     #[clap(subcommand)]
     Root(root::Command),
-    /// Delegation Commands
-    Delegation(Delegation),
-    /// Clone a TUF repository, including metadata and some or all targets
-    Clone(clone::CloneArgs),
+    /// Transfer a TUF repository's metadata from a previous root to a new root
+    TransferMetadata(transfer_metadata::TransferMetadataArgs),
+    /// Update a TUF repository's metadata and optionally add targets
+    Update(Box<update::UpdateArgs>),
 }
 
 impl Command {
-    fn run(self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         match self {
-            Command::Create(args) => args.run(),
-            Command::Root(root_subcommand) => root_subcommand.run(),
-            Command::Download(args) => args.run(),
-            Command::Update(args) => args.run(),
-            Command::Delegation(cmd) => cmd.run(),
-            Command::Clone(cmd) => cmd.run(),
+            Command::Create(args) => args.run().await,
+            Command::Root(root_subcommand) => root_subcommand.run().await,
+            Command::Download(args) => args.run().await,
+            Command::Update(args) => args.run().await,
+            Command::Delegation(cmd) => cmd.run().await,
+            Command::Clone(cmd) => cmd.run().await,
+            Command::TransferMetadata(cmd) => cmd.run().await,
         }
     }
 }
 
-fn load_file<T>(path: &Path) -> Result<T>
+async fn load_file<T>(path: &Path) -> Result<T>
 where
     for<'de> T: serde::Deserialize<'de>,
 {
-    serde_json::from_reader(File::open(path).context(error::FileOpenSnafu { path })?)
-        .context(error::FileParseJsonSnafu { path })
+    serde_json::from_slice(
+        &tokio::fs::read(path)
+            .await
+            .context(error::FileOpenSnafu { path })?,
+    )
+    .context(error::FileParseJsonSnafu { path })
 }
 
-fn write_file<T>(path: &Path, json: &T) -> Result<()>
+async fn write_file<T>(path: &Path, json: T) -> Result<()>
 where
-    T: serde::Serialize,
+    T: serde::Serialize + Send + Sync + 'static,
 {
-    // Use `tempfile::NamedTempFile::persist` to perform an atomic file write.
-    let parent = path.parent().context(error::PathParentSnafu { path })?;
-    let mut writer =
-        NamedTempFile::new_in(parent).context(error::FileTempCreateSnafu { path: parent })?;
-    serde_json::to_writer_pretty(&mut writer, json).context(error::FileWriteJsonSnafu { path })?;
-    writer
-        .write_all(b"\n")
-        .context(error::FileWriteSnafu { path })?;
-    writer
-        .persist(path)
-        .context(error::FilePersistSnafu { path })?;
-    Ok(())
+    let parent = path
+        .parent()
+        .context(error::PathParentSnafu { path })?
+        .to_path_buf();
+    let path = path.to_path_buf();
+
+    // Spawn a thread to avoid blocking.
+    let rt = Handle::current();
+    let task = rt.spawn_blocking(move || {
+        // Use `tempfile::NamedTempFile::persist` to perform an atomic file write.
+        let file =
+            NamedTempFile::new_in(&parent).context(error::FileTempCreateSnafu { path: parent })?;
+
+        let (mut file, tmp_path) = file.into_parts();
+
+        let buf =
+            serde_json::to_vec_pretty(&json).context(error::FileWriteJsonSnafu { path: &path })?;
+        file.write_all(&buf)
+            .context(error::FileWriteSnafu { path: &path })?;
+
+        NamedTempFile::from_parts(file, tmp_path)
+            .persist(&path)
+            .context(error::FilePersistSnafu { path })?;
+
+        Ok(())
+    });
+
+    task.await.context(error::JoinTaskSnafu)?
 }
 
 // Walk the directory specified, building a map of filename to Target structs.
 // Hashing of the targets is done in parallel
-fn build_targets<P>(indir: P, follow_links: bool) -> Result<HashMap<TargetName, Target>>
+async fn build_targets<P>(indir: P, follow_links: bool) -> Result<HashMap<TargetName, Target>>
 where
     P: AsRef<Path>,
 {
-    let indir = indir.as_ref();
-    WalkDir::new(indir)
-        .follow_links(follow_links)
-        .into_iter()
-        .par_bridge()
-        .filter_map(|entry| match entry {
-            Ok(entry) => {
-                if entry.file_type().is_file() {
-                    Some(process_target(entry.path()))
-                } else {
-                    None
+    let indir = indir.as_ref().to_owned();
+
+    let (tx, rx) = tokio::sync::mpsc::channel(10);
+    let indir_clone = indir.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let walker = WalkDir::new(indir_clone.clone()).follow_links(follow_links);
+
+        for entry in walker {
+            if tx.blocking_send(entry).is_err() {
+                // Receiver error'ed out
+                break;
+            };
+        }
+        Ok(())
+    });
+
+    // Spawn tasks to process targets concurrently.
+    let join_handles =
+        futures::stream::unfold(
+            rx,
+            move |mut rx| async move { Some((rx.recv().await?, rx)) },
+        )
+        .filter_map(|entry| {
+            let indir = indir.clone();
+            async move {
+                match entry {
+                    Ok(entry) => {
+                        if entry.file_type().is_file() {
+                            let future = async move { process_target(entry.path()).await };
+                            Some(Ok(tokio::task::spawn(future)))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => Some(Err(err).context(error::WalkDirSnafu { directory: indir })),
                 }
             }
-            Err(err) => Some(Err(err).context(error::WalkDirSnafu { directory: indir })),
         })
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    // Await all tasks.
+    futures::future::try_join_all(join_handles)
+        .await
+        .context(error::JoinTaskSnafu {})?
+        .into_iter()
         .collect()
 }
 
-fn process_target(path: &Path) -> Result<(TargetName, Target)> {
+async fn process_target(path: &Path) -> Result<(TargetName, Target)> {
     // Get the file name as a TargetName
     let target_name = TargetName::new(
         path.file_name()
@@ -167,13 +218,16 @@ fn process_target(path: &Path) -> Result<(TargetName, Target)> {
     .context(error::InvalidTargetNameSnafu)?;
 
     // Build a Target from the path given. If it is not a file, this will fail
-    let target = Target::from_path(path).context(error::TargetFromPathSnafu { path })?;
+    let target = Target::from_path(path)
+        .await
+        .context(error::TargetFromPathSnafu { path })?;
 
     Ok((target_name, target))
 }
 
-fn main() -> ! {
-    std::process::exit(match Program::from_args().run() {
+#[tokio::main]
+async fn main() -> ! {
+    std::process::exit(match Program::parse().run().await {
         Ok(()) => 0,
         Err(err) => {
             eprintln!("{err}");
@@ -200,36 +254,36 @@ struct Delegation {
 }
 
 impl Delegation {
-    fn run(self) -> Result<()> {
-        self.cmd.run(&self.role)
+    async fn run(self) -> Result<()> {
+        self.cmd.run(&self.role).await
     }
 }
 
 #[derive(Debug, Parser)]
 enum DelegationCommand {
-    /// Creates a delegated role
-    CreateRole(Box<create_role::CreateRoleArgs>),
-    /// Add delegated role
-    AddRole(Box<add_role::AddRoleArgs>),
-    /// Update Delegated targets
-    UpdateDelegatedTargets(Box<update_targets::UpdateTargetsArgs>),
     /// Add a key to a delegated role
     AddKey(Box<add_key_role::AddKeyArgs>),
-    /// Remove a key from a delegated role
-    RemoveKey(Box<remove_key_role::RemoveKeyArgs>),
+    /// Add delegated role
+    AddRole(Box<add_role::AddRoleArgs>),
+    /// Creates a delegated role
+    CreateRole(Box<create_role::CreateRoleArgs>),
     /// Remove a role
     Remove(Box<remove_role::RemoveRoleArgs>),
+    /// Remove a key from a delegated role
+    RemoveKey(Box<remove_key_role::RemoveKeyArgs>),
+    /// Update Delegated targets
+    UpdateDelegatedTargets(Box<update_targets::UpdateTargetsArgs>),
 }
 
 impl DelegationCommand {
-    fn run(self, role: &str) -> Result<()> {
+    async fn run(self, role: &str) -> Result<()> {
         match self {
-            DelegationCommand::CreateRole(args) => args.run(role),
-            DelegationCommand::AddRole(args) => args.run(role),
-            DelegationCommand::UpdateDelegatedTargets(args) => args.run(role),
-            DelegationCommand::AddKey(args) => args.run(role),
-            DelegationCommand::RemoveKey(args) => args.run(role),
-            DelegationCommand::Remove(args) => args.run(role),
+            DelegationCommand::CreateRole(args) => args.run(role).await,
+            DelegationCommand::AddRole(args) => args.run(role).await,
+            DelegationCommand::UpdateDelegatedTargets(args) => args.run(role).await,
+            DelegationCommand::AddKey(args) => args.run(role).await,
+            DelegationCommand::RemoveKey(args) => args.run(role).await,
+            DelegationCommand::Remove(args) => args.run(role).await,
         }
     }
 }

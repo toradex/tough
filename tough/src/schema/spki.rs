@@ -20,6 +20,7 @@
 use super::error::{self, Compat, Result};
 use ring::io::der;
 use snafu::{OptionExt, ResultExt};
+use untrusted::Input;
 
 pub(super) static OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113_549, 1, 1, 1];
 pub(super) static OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10_045, 2, 1];
@@ -44,13 +45,8 @@ pub(super) fn encode(algorithm_oid: &[u64], parameters_oid: Option<&[u64]>, b: &
     let spki = asn1_tag(der::Tag::Sequence, sequence);
 
     pem::encode_config(
-        &pem::Pem {
-            tag: "PUBLIC KEY".to_owned(),
-            contents: spki,
-        },
-        pem::EncodeConfig {
-            line_ending: pem::LineEnding::LF,
-        },
+        &pem::Pem::new("PUBLIC KEY".to_owned(), spki),
+        pem::EncodeConfig::new().set_line_ending(pem::LineEnding::LF),
     )
     .trim()
     .to_owned()
@@ -65,21 +61,34 @@ pub(super) fn decode(
     let pem = pem::parse(input)
         .map_err(Compat)
         .context(error::PemDecodeSnafu)?;
-    Ok(untrusted::Input::from(&pem.contents)
+    Ok(untrusted::Input::from(pem.contents())
         .read_all(ring::error::Unspecified, |input| {
             der::expect_tag_and_get_value(input, der::Tag::Sequence).and_then(|spki| {
                 spki.read_all(ring::error::Unspecified, |input| {
                     der::expect_tag_and_get_value(input, der::Tag::Sequence).and_then(
                         |alg_ident| {
                             alg_ident.read_all(ring::error::Unspecified, |input| {
-                                if der::expect_tag_and_get_value(input, der::Tag::OID)?
-                                    != untrusted::Input::from(&asn1_encode_oid(algorithm_oid))
+                                let expected_tag_value =
+                                    der::expect_tag_and_get_value(input, der::Tag::OID)?;
+
+                                let asn1_encode = asn1_encode_oid(algorithm_oid);
+                                let algo_encode_oid: Input<'_> =
+                                    untrusted::Input::from(&asn1_encode);
+
+                                // Note: we use "less safe" here but this is OK. With the way we are using the `Input`,
+                                // we don't need to be concerned about it being too large or being parsed multiple times.
+                                if expected_tag_value.as_slice_less_safe()
+                                    != algo_encode_oid.as_slice_less_safe()
                                 {
                                     return Err(ring::error::Unspecified);
                                 }
+
                                 if let Some(parameters_oid) = parameters_oid {
-                                    if der::expect_tag_and_get_value(input, der::Tag::OID)?
-                                        != untrusted::Input::from(&asn1_encode_oid(parameters_oid))
+                                    let asn1_encode = asn1_encode_oid(parameters_oid);
+                                    let param_encode_oid: Input<'_> =
+                                        untrusted::Input::from(&asn1_encode);
+                                    if expected_tag_value.as_slice_less_safe()
+                                        != param_encode_oid.as_slice_less_safe()
                                     {
                                         return Err(ring::error::Unspecified);
                                     }
